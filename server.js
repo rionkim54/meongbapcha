@@ -3,23 +3,31 @@ const multer = require('multer');
 const cookieSession = require('cookie-session');
 const { exiftool } = require('exiftool-vendored');
 const heicConvert = require('heic-convert');
-const { DatabaseSync } = require('node:sqlite');
+const sharp = require('sharp');
+const { createClient } = require('@libsql/client');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
-// 데이터 폴더: 배포 시 영구 디스크 경로를 DATA_DIR 환경변수로 지정 (예: /data)
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
-const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// 업로드 임시 폴더 (사진은 DB에 저장하고 이 파일은 곧 삭제)
+const TMP_DIR = path.join(os.tmpdir(), 'meongbapcha-uploads');
+fs.mkdirSync(TMP_DIR, { recursive: true });
 
 // 로그인 설정 (배포 시 환경변수로 꼭 변경!)
 const APP_PASSWORD = process.env.APP_PASSWORD || 'meongbapcha';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'dev-secret-please-change';
 
-// ---------- DB ----------
-const db = new DatabaseSync(path.join(DATA_DIR, 'meongbapcha.db'));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS dogs (
+// ---------- DB (Turso / 로컬 파일 자동 선택) ----------
+// 배포: TURSO_DATABASE_URL + TURSO_AUTH_TOKEN 환경변수 사용
+// 로컬: 환경변수 없으면 data/meongbapcha.db 파일 사용
+const LOCAL_DB = path.join(__dirname, 'data', 'meongbapcha.db');
+if (!process.env.TURSO_DATABASE_URL) fs.mkdirSync(path.dirname(LOCAL_DB), { recursive: true });
+const db = process.env.TURSO_DATABASE_URL
+  ? createClient({ url: process.env.TURSO_DATABASE_URL, authToken: process.env.TURSO_AUTH_TOKEN })
+  : createClient({ url: 'file:' + LOCAL_DB });
+
+async function initDb() {
+  await db.execute(`CREATE TABLE IF NOT EXISTS dogs (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     name       TEXT NOT NULL,
     gender     TEXT,
@@ -27,28 +35,37 @@ db.exec(`
     location   TEXT,
     notes      TEXT,
     photo      TEXT,
-    found_at   TEXT,                                  -- 발견/등록 일시 (사용자 지정 또는 사진 EXIF)
-    lat        REAL,                                  -- 사진 EXIF GPS 위도
-    lng        REAL,                                  -- 사진 EXIF GPS 경도
+    found_at   TEXT,
+    lat        REAL,
+    lng        REAL,
+    address    TEXT,
     created_at TEXT DEFAULT (datetime('now','localtime'))
-  );
-  CREATE TABLE IF NOT EXISTS treatments (
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS treatments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     dog_id     INTEGER NOT NULL,
-    date       TEXT,                                  -- 치료 일시
-    symptom    TEXT,                                  -- 증상
-    treatment  TEXT,                                  -- 처치 내용
-    hospital   TEXT,                                  -- 병원
-    created_at TEXT DEFAULT (datetime('now','localtime')),
-    FOREIGN KEY (dog_id) REFERENCES dogs(id) ON DELETE CASCADE
-  );
-`);
+    date       TEXT,
+    symptom    TEXT,
+    treatment  TEXT,
+    hospital   TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+  )`);
+  // 사진은 DB에 보관 (Render 무료는 파일 저장이 임시라 사라지므로)
+  await db.execute(`CREATE TABLE IF NOT EXISTS photos (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    mime TEXT,
+    data BLOB
+  )`);
+  // 예전 로컬 DB 대비 컬럼 보강 (이미 있으면 무시)
+  for (const col of ['lat REAL', 'lng REAL', 'address TEXT']) {
+    try { await db.execute(`ALTER TABLE dogs ADD COLUMN ${col}`); } catch { /* 이미 있음 */ }
+  }
+}
 
-// 기존 DB에 lat/lng 컬럼이 없으면 추가 (마이그레이션)
-const dogCols = db.prepare('PRAGMA table_info(dogs)').all().map((c) => c.name);
-if (!dogCols.includes('lat')) db.exec('ALTER TABLE dogs ADD COLUMN lat REAL');
-if (!dogCols.includes('lng')) db.exec('ALTER TABLE dogs ADD COLUMN lng REAL');
-if (!dogCols.includes('address')) db.exec('ALTER TABLE dogs ADD COLUMN address TEXT'); // GPS → 주소
+// 작은 SQL 헬퍼
+const all = async (sql, args = []) => (await db.execute({ sql, args })).rows;
+const get = async (sql, args = []) => (await db.execute({ sql, args })).rows[0] || null;
+const run = async (sql, args = []) => await db.execute({ sql, args });
 
 const pad = (n) => String(n).padStart(2, '0');
 
@@ -58,7 +75,7 @@ async function readPhotoExif(filePath) {
   try {
     const t = await exiftool.read(filePath);
     if (Number.isFinite(t.GPSLatitude) && Number.isFinite(t.GPSLongitude)) {
-      out.lat = t.GPSLatitude;     // ExifTool은 위/경도 부호까지 적용된 십진수 반환
+      out.lat = t.GPSLatitude;
       out.lng = t.GPSLongitude;
     }
     const d = t.DateTimeOriginal;
@@ -72,23 +89,6 @@ async function readPhotoExif(filePath) {
   return out;
 }
 
-// 아이폰 HEIC/HEIF 사진은 브라우저가 못 띄우므로 JPEG로 변환. 변환된 새 파일명을 반환.
-async function convertHeicIfNeeded(file) {
-  const isHeic = /image\/hei[cf]/i.test(file.mimetype) || /\.hei[cf]$/i.test(file.originalname);
-  if (!isHeic) return file.filename;
-  try {
-    const inputBuffer = fs.readFileSync(file.path);
-    const outputBuffer = await heicConvert({ buffer: inputBuffer, format: 'JPEG', quality: 0.85 });
-    const newName = file.filename.replace(/\.[^.]+$/, '') + '.jpg';
-    fs.writeFileSync(path.join(UPLOAD_DIR, newName), outputBuffer);
-    fs.unlinkSync(file.path); // 원본 HEIC 삭제
-    return newName;
-  } catch (e) {
-    console.error('HEIC 변환 실패:', e.message);
-    return file.filename; // 변환 실패 시 원본 유지
-  }
-}
-
 // 위경도 → 한글 주소 (OpenStreetMap Nominatim, 무료)
 async function reverseGeocode(lat, lng) {
   try {
@@ -97,7 +97,6 @@ async function reverseGeocode(lat, lng) {
     if (!r.ok) return null;
     const j = await r.json();
     if (!j.display_name) return null;
-    // "110, 세종대로, 명동, 중구, 서울특별시, 04524, 대한민국" → "서울특별시 중구 명동 세종대로 110"
     const parts = j.display_name.split(',').map((s) => s.trim())
       .filter((s) => s && s !== '대한민국' && !/^\d{4,6}$/.test(s));
     return parts.reverse().join(' ');
@@ -106,19 +105,43 @@ async function reverseGeocode(lat, lng) {
   }
 }
 
-// 업로드 사진 처리: HEIC 변환 → EXIF(일시·GPS) 추출 → GPS면 주소 변환
+// 업로드 사진 처리: EXIF 추출 → HEIC면 JPEG 변환 → 회전보정/리사이즈/압축 → 주소
+// 반환: { buffer, mime, lat, lng, found_at, address }
 async function processPhoto(file) {
-  const exif = await readPhotoExif(file.path);            // 변환 전 원본에서 EXIF 읽기 (HEIC도 GPS 보유)
-  const filename = await convertHeicIfNeeded(file);       // 그 다음 JPEG로 변환
+  const exif = await readPhotoExif(file.path);
+  let buf = fs.readFileSync(file.path);
+  const isHeic = /image\/hei[cf]/i.test(file.mimetype) || /\.hei[cf]$/i.test(file.originalname);
+  if (isHeic) {
+    try { buf = Buffer.from(await heicConvert({ buffer: buf, format: 'JPEG', quality: 0.9 })); }
+    catch (e) { console.error('HEIC 변환 실패:', e.message); }
+  }
+  let mime = 'image/jpeg';
+  try {
+    buf = await sharp(buf).rotate()  // EXIF 방향 보정
+      .resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 80 }).toBuffer();
+  } catch (e) {
+    console.error('이미지 처리 실패:', e.message);
+    mime = file.mimetype || 'image/jpeg';
+  }
+  fs.unlink(file.path, () => {}); // 임시 파일 삭제
   let address = null;
   if (exif.lat != null && exif.lng != null) address = await reverseGeocode(exif.lat, exif.lng);
-  return { photo: `/uploads/${filename}`, lat: exif.lat, lng: exif.lng, found_at: exif.found_at, address };
+  return { buffer: buf, mime, lat: exif.lat, lng: exif.lng, found_at: exif.found_at, address };
+}
+
+async function savePhoto(buffer, mime) {
+  const r = await run('INSERT INTO photos (mime, data) VALUES (?, ?)', [mime, buffer]);
+  return Number(r.lastInsertRowid);
+}
+async function deletePhotoByUrl(url) {
+  const m = url && url.match(/^\/photo\/(\d+)$/);
+  if (m) { try { await run('DELETE FROM photos WHERE id = ?', [Number(m[1])]); } catch {} }
 }
 
 // 이름을 비워두면 자동으로 지어줄 귀여운 기본 이름 풀
 const NAME_POOL = ['초코', '보리', '까미', '콩이', '별이', '구름', '단추', '두부',
   '감자', '뭉치', '솜이', '호두', '마루', '복실', '봄이', '하루', '코코', '몽이'];
-// id 기준으로 중복 없는 이름 생성 (풀을 한 바퀴 넘기면 번호 부여)
 function autoName(id) {
   const base = NAME_POOL[(id - 1) % NAME_POOL.length];
   const round = Math.floor((id - 1) / NAME_POOL.length);
@@ -143,16 +166,16 @@ function exifDateStr(d) {
 
 // ---------- App ----------
 const app = express();
-app.set('trust proxy', 1); // 클라우드(프록시) 뒤 환경 대응
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cookieSession({
   name: 'mbc_session',
   secret: SESSION_SECRET,
-  maxAge: 30 * 24 * 60 * 60 * 1000, // 30일 로그인 유지
+  maxAge: 30 * 24 * 60 * 60 * 1000,
   httpOnly: true,
   sameSite: 'lax',
 }));
-app.use(express.static(path.join(__dirname, 'public'))); // 로그인 페이지는 누구나 접근
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- 로그인 ----------
 function requireAuth(req, res, next) {
@@ -169,20 +192,27 @@ app.post('/api/login', (req, res) => {
 app.post('/api/logout', (req, res) => { req.session = null; res.json({ ok: true }); });
 app.get('/api/me', (req, res) => res.json({ authed: !!(req.session && req.session.authed) }));
 
-// 이 아래의 모든 /api 와 /uploads 는 로그인 필요
-app.use('/api', requireAuth);
-app.use('/uploads', requireAuth, express.static(UPLOAD_DIR));
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname) || '.jpg';
-    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  },
+// 사진 제공 (DB 블롭) — 로그인 필요
+app.get('/photo/:id', requireAuth, async (req, res) => {
+  const row = await get('SELECT mime, data FROM photos WHERE id = ?', [Number(req.params.id)]);
+  if (!row || !row.data) return res.status(404).end();
+  res.set('Content-Type', row.mime || 'image/jpeg');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  res.end(Buffer.from(row.data));
 });
+
+// 예전 로컬 데이터 호환: data/uploads 의 사진도 계속 제공 (배포 환경엔 파일이 없어 영향 없음)
+app.use('/uploads', requireAuth, express.static(path.join(__dirname, 'data', 'uploads')));
+
+// 이 아래의 모든 /api 는 로그인 필요
+app.use('/api', requireAuth);
+
 const upload = multer({
-  storage,
-  limits: { fileSize: 30 * 1024 * 1024 }, // 30MB (요즘 폰 사진 대응)
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, TMP_DIR),
+    filename: (req, file, cb) => cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}`),
+  }),
+  limits: { fileSize: 30 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const ok = file.mimetype.startsWith('image/') || /\.(hei[cf]|jpe?g|png|webp|gif)$/i.test(file.originalname);
     cb(null, ok);
@@ -190,27 +220,20 @@ const upload = multer({
 });
 
 // ---------- 강아지 API ----------
-// 목록
-app.get('/api/dogs', (req, res) => {
-  const rows = db.prepare(`
-    SELECT d.*,
-      (SELECT COUNT(*) FROM treatments t WHERE t.dog_id = d.id) AS treatment_count
-    FROM dogs d ORDER BY d.id DESC
-  `).all();
+app.get('/api/dogs', async (req, res) => {
+  const rows = await all(`
+    SELECT d.*, (SELECT COUNT(*) FROM treatments t WHERE t.dog_id = d.id) AS treatment_count
+    FROM dogs d ORDER BY d.id DESC`);
   res.json(rows);
 });
 
-// 상세 (+ 치료기록)
-app.get('/api/dogs/:id', (req, res) => {
-  const dog = db.prepare('SELECT * FROM dogs WHERE id = ?').get(req.params.id);
+app.get('/api/dogs/:id', async (req, res) => {
+  const dog = await get('SELECT * FROM dogs WHERE id = ?', [req.params.id]);
   if (!dog) return res.status(404).json({ error: '강아지를 찾을 수 없습니다.' });
-  dog.treatments = db.prepare(
-    'SELECT * FROM treatments WHERE dog_id = ? ORDER BY date DESC, id DESC'
-  ).all(req.params.id);
+  dog.treatments = await all('SELECT * FROM treatments WHERE dog_id = ? ORDER BY date DESC, id DESC', [req.params.id]);
   res.json(dog);
 });
 
-// 등록
 app.post('/api/dogs', upload.single('photo'), async (req, res) => {
   const { name, gender, age, location, notes, found_at } = req.body;
   const providedName = name && name.trim();
@@ -218,63 +241,59 @@ app.post('/api/dogs', upload.single('photo'), async (req, res) => {
   let photo = null, lat = null, lng = null, address = null, finalFoundAt = found_at || null;
   if (req.file) {
     const p = await processPhoto(req.file);
-    photo = p.photo; lat = p.lat; lng = p.lng; address = p.address;
-    if (!finalFoundAt && p.found_at) finalFoundAt = p.found_at; // 사용자 입력 우선, 없으면 EXIF
+    lat = p.lat; lng = p.lng; address = p.address;
+    if (!finalFoundAt && p.found_at) finalFoundAt = p.found_at;
+    photo = `/photo/${await savePhoto(p.buffer, p.mime)}`;
   }
 
-  // 이름 없이 먼저 등록 → 부여된 id로 기본 이름 자동 생성
-  const info = db.prepare(`
-    INSERT INTO dogs (name, gender, age, location, notes, photo, found_at, lat, lng, address)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(providedName || '', gender || null, age || null, location || null, notes || null,
-         photo, finalFoundAt, lat, lng, address);
+  const info = await run(
+    `INSERT INTO dogs (name, gender, age, location, notes, photo, found_at, lat, lng, address)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [providedName || '', gender || null, age || null, location || null, notes || null,
+     photo, finalFoundAt, lat, lng, address]);
 
-  const id = info.lastInsertRowid;
+  const id = Number(info.lastInsertRowid);
   const autoNamed = !providedName;
   const finalName = providedName || autoName(id);
-  if (autoNamed) db.prepare('UPDATE dogs SET name=? WHERE id=?').run(finalName, id);
+  if (autoNamed) await run('UPDATE dogs SET name = ? WHERE id = ?', [finalName, id]);
 
   res.json({ id, name: finalName, autoNamed, lat, lng, address, found_at: finalFoundAt, exifGps: lat != null });
 });
 
-// 수정
 app.put('/api/dogs/:id', upload.single('photo'), async (req, res) => {
-  const dog = db.prepare('SELECT * FROM dogs WHERE id = ?').get(req.params.id);
+  const dog = await get('SELECT * FROM dogs WHERE id = ?', [req.params.id]);
   if (!dog) return res.status(404).json({ error: '강아지를 찾을 수 없습니다.' });
   const { name, gender, age, location, notes, found_at } = req.body;
 
   let photo = dog.photo, lat = dog.lat, lng = dog.lng, address = dog.address;
   let finalFoundAt = found_at ?? dog.found_at;
   if (req.file) {
-    const p = await processPhoto(req.file);   // 새 사진이면 사진·좌표·주소·일시 갱신
-    photo = p.photo; lat = p.lat; lng = p.lng; address = p.address;
+    const p = await processPhoto(req.file);
+    lat = p.lat; lng = p.lng; address = p.address;
     if (!found_at && p.found_at) finalFoundAt = p.found_at;
+    await deletePhotoByUrl(dog.photo);                 // 옛 사진 정리
+    photo = `/photo/${await savePhoto(p.buffer, p.mime)}`;
   }
 
-  const finalName = (name && name.trim()) ? name.trim() : dog.name; // 비우면 기존 이름 유지
-  db.prepare(`
-    UPDATE dogs SET name=?, gender=?, age=?, location=?, notes=?, photo=?, found_at=?, lat=?, lng=?, address=? WHERE id=?
-  `).run(
-    finalName, gender ?? dog.gender, age ?? dog.age,
-    location ?? dog.location, notes ?? dog.notes, photo, finalFoundAt, lat, lng, address,
-    req.params.id
-  );
+  const finalName = (name && name.trim()) ? name.trim() : dog.name;
+  await run(
+    `UPDATE dogs SET name=?, gender=?, age=?, location=?, notes=?, photo=?, found_at=?, lat=?, lng=?, address=? WHERE id=?`,
+    [finalName, gender ?? dog.gender, age ?? dog.age, location ?? dog.location, notes ?? dog.notes,
+     photo, finalFoundAt, lat, lng, address, req.params.id]);
   res.json({ ok: true, lat, lng, address, found_at: finalFoundAt, exifGps: lat != null });
 });
 
-// 사진 분석 (저장하지 않고 EXIF GPS·상세정보만 추출해서 미리보기 제공)
+// 사진 분석 (저장하지 않고 EXIF GPS·상세정보만 추출)
 app.post('/api/analyze', upload.single('photo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: '사진이 없습니다.' });
   try {
     const t = await exiftool.read(req.file.path);
-
     let gps = null, address = null;
     if (Number.isFinite(t.GPSLatitude) && Number.isFinite(t.GPSLongitude)) {
       gps = { lat: t.GPSLatitude, lng: t.GPSLongitude };
       address = await reverseGeocode(gps.lat, gps.lng);
     }
     const dateTime = exifDateStr(t.DateTimeOriginal) || exifDateStr(t.CreateDate);
-
     const details = [];
     const push = (label, value) => { if (value != null && value !== '') details.push({ label, value: String(value) }); };
     push('촬영일시', dateTime);
@@ -290,40 +309,39 @@ app.post('/api/analyze', upload.single('photo'), async (req, res) => {
     push('초점거리', t.FocalLength);
     push('편집프로그램', t.Software);
     if (gps) push('GPS 좌표', `${gps.lat.toFixed(6)}, ${gps.lng.toFixed(6)}`);
-
     res.json({ gps, address, dateTime, details });
   } catch (e) {
     res.status(500).json({ error: '사진을 분석하지 못했어요: ' + e.message });
   } finally {
-    fs.unlink(req.file.path, () => {}); // 임시 파일 삭제
+    fs.unlink(req.file.path, () => {});
   }
 });
 
-// 삭제
-app.delete('/api/dogs/:id', (req, res) => {
-  db.prepare('DELETE FROM treatments WHERE dog_id = ?').run(req.params.id);
-  db.prepare('DELETE FROM dogs WHERE id = ?').run(req.params.id);
+app.delete('/api/dogs/:id', async (req, res) => {
+  const dog = await get('SELECT photo FROM dogs WHERE id = ?', [req.params.id]);
+  if (dog) await deletePhotoByUrl(dog.photo);
+  await run('DELETE FROM treatments WHERE dog_id = ?', [req.params.id]);
+  await run('DELETE FROM dogs WHERE id = ?', [req.params.id]);
   res.json({ ok: true });
 });
 
 // ---------- 치료기록 API ----------
-app.post('/api/dogs/:id/treatments', (req, res) => {
-  const dog = db.prepare('SELECT id FROM dogs WHERE id = ?').get(req.params.id);
+app.post('/api/dogs/:id/treatments', async (req, res) => {
+  const dog = await get('SELECT id FROM dogs WHERE id = ?', [req.params.id]);
   if (!dog) return res.status(404).json({ error: '강아지를 찾을 수 없습니다.' });
   const { date, symptom, treatment, hospital } = req.body;
-  const info = db.prepare(`
-    INSERT INTO treatments (dog_id, date, symptom, treatment, hospital)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(req.params.id, date || null, symptom || null, treatment || null, hospital || null);
-  res.json({ id: info.lastInsertRowid });
+  const info = await run(
+    'INSERT INTO treatments (dog_id, date, symptom, treatment, hospital) VALUES (?, ?, ?, ?, ?)',
+    [req.params.id, date || null, symptom || null, treatment || null, hospital || null]);
+  res.json({ id: Number(info.lastInsertRowid) });
 });
 
-app.delete('/api/treatments/:id', (req, res) => {
-  db.prepare('DELETE FROM treatments WHERE id = ?').run(req.params.id);
+app.delete('/api/treatments/:id', async (req, res) => {
+  await run('DELETE FROM treatments WHERE id = ?', [req.params.id]);
   res.json({ ok: true });
 });
 
-// 업로드/일반 에러 처리 (사진 용량 초과 등)
+// 에러 처리
 app.use((err, req, res, next) => {
   console.error('에러:', err.message);
   if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
@@ -333,4 +351,6 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🐶 멍이밥차 지원 프로그램 실행 중: http://localhost:${PORT}`));
+initDb()
+  .then(() => app.listen(PORT, () => console.log(`🐶 멍이밥차 지원 프로그램 실행 중: http://localhost:${PORT}`)))
+  .catch((e) => { console.error('DB 초기화 실패:', e); process.exit(1); });

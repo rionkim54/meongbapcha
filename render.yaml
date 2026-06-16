@@ -1,0 +1,16 @@
+# Render 배포 설정 (Blueprint). 대시보드에서 자동 인식됩니다.
+services:
+  - type: web
+    name: meongbapcha
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/me
+    envVars:
+      - key: APP_PASSWORD          # 로그인 비밀번호 (직접 입력)
+        sync: false
+      - key: SESSION_SECRET        # 자동 생성되는 긴 비밀키
+        generateValue: true
+      - key: TURSO_DATABASE_URL    # Turso 데이터베이스 주소 (직접 입력)
+        sync: false
+      - key: TURSO_AUTH_TOKEN      # Turso 토큰 (직접 입력)
+        sync: false

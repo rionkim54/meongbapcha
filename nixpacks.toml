@@ -1,0 +1,4 @@
+# Railway/Nixpacks 빌드 설정
+# exiftool-vendored 는 리눅스에서 Perl 이 필요하므로 추가 설치합니다.
+[phases.setup]
+aptPkgs = ["perl"]

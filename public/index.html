@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🐶 멍이밥차 지원 프로그램</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- 로그인 화면 -->
+  <div id="loginView" class="login-view" hidden>
+    <form id="loginForm" class="login-box">
+      <div class="login-emoji">🐶</div>
+      <h1>멍이밥차 지원 프로그램</h1>
+      <p class="sub">접속하려면 비밀번호를 입력하세요</p>
+      <input type="password" id="loginPassword" placeholder="비밀번호" autocomplete="current-password" />
+      <div id="loginError" class="login-error" hidden></div>
+      <button type="submit" class="primary">로그인</button>
+    </form>
+  </div>
+
+  <header>
+    <button id="logoutBtn" class="logout-btn" hidden>로그아웃</button>
+    <h1>🐶 멍이밥차 지원 프로그램</h1>
+    <p class="sub">강아지 등록 · 발견 일시 · 치료 기록 관리</p>
+  </header>
+
+  <main>
+    <!-- 목록 화면 -->
+    <section id="listView">
+      <div class="bar">
+        <input id="search" type="text" placeholder="이름/위치 검색…" />
+        <button id="newBtn" class="primary">+ 강아지 등록</button>
+      </div>
+      <div id="overviewMapWrap" hidden>
+        <div class="map-label">🗺️ 발견 위치 지도</div>
+        <div id="overviewMap" class="map"></div>
+      </div>
+      <div id="grid" class="grid"></div>
+      <p id="emptyMsg" class="empty" hidden>아직 등록된 강아지가 없어요. 첫 강아지를 등록해 보세요! 🐾</p>
+    </section>
+
+    <!-- 상세 화면 -->
+    <section id="detailView" hidden></section>
+  </main>
+
+  <!-- 강아지 등록/수정 모달 -->
+  <div id="dogModal" class="modal" hidden>
+    <div class="modal-box">
+      <h2 id="dogModalTitle">강아지 등록</h2>
+      <form id="dogForm">
+        <input type="hidden" id="dogId" />
+        <label>사진
+          <input type="file" id="photo" accept="image/*" />
+        </label>
+        <img id="photoPreview" class="preview" hidden />
+        <div id="exifBox" hidden>
+          <div id="exifSummary" class="exif-summary"></div>
+          <div id="exifMapWrap" hidden><div id="exifMap" class="map"></div></div>
+          <button type="button" id="exifDetailBtn" class="ghost small" hidden>📋 상세정보 보기</button>
+          <div id="exifDetails" class="exif-details" hidden></div>
+        </div>
+        <label>이름 <span class="hint">(비워두면 자동으로 지어줘요)</span>
+          <input type="text" id="name" placeholder="예: 멍이 — 비우면 자동 생성" />
+        </label>
+        <div class="row">
+          <label>성별
+            <select id="gender">
+              <option value="">선택</option>
+              <option>수컷</option>
+              <option>암컷</option>
+              <option>모름</option>
+            </select>
+          </label>
+          <label>추정 나이
+            <input type="text" id="age" placeholder="예: 2살, 새끼" />
+          </label>
+        </div>
+        <label>발견/등록 일시
+          <input type="datetime-local" id="found_at" />
+        </label>
+        <label>발견 위치
+          <input type="text" id="location" placeholder="예: ○○동 공원 앞" />
+        </label>
+        <label>특이사항 메모
+          <textarea id="notes" rows="3" placeholder="성격, 외형, 기타 메모"></textarea>
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-close>취소</button>
+          <button type="submit" class="primary">저장</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 치료기록 추가 모달 -->
+  <div id="treatModal" class="modal" hidden>
+    <div class="modal-box">
+      <h2>치료 기록 추가</h2>
+      <form id="treatForm">
+        <input type="hidden" id="treatDogId" />
+        <label>치료 일시
+          <input type="datetime-local" id="t_date" />
+        </label>
+        <label>증상
+          <input type="text" id="t_symptom" placeholder="예: 다리 절뚝거림" />
+        </label>
+        <label>처치 내용
+          <textarea id="t_treatment" rows="3" placeholder="예: 소독, 항생제 투여"></textarea>
+        </label>
+        <label>병원
+          <input type="text" id="t_hospital" placeholder="예: ○○동물병원" />
+        </label>
+        <div class="modal-actions">
+          <button type="button" class="ghost" data-close>취소</button>
+          <button type="submit" class="primary">추가</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

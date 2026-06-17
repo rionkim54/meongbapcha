@@ -260,31 +260,48 @@ $('#exifDetailBtn').addEventListener('click', () => {
   $('#exifDetailBtn').textContent = box.hidden ? '📋 상세정보 보기' : '📋 상세정보 닫기';
 });
 
+let dogSubmitting = false; // 중복 등록 방지
 $('#dogForm').addEventListener('submit', async (e) => {
   e.preventDefault();
-  const id = $('#dogId').value;
-  const fd = new FormData();
-  fd.append('name', $('#name').value);
-  fd.append('gender', $('#gender').value);
-  fd.append('age', $('#age').value);
-  fd.append('location', $('#location').value);
-  fd.append('notes', $('#notes').value);
-  fd.append('found_at', $('#found_at').value);
-  if ($('#photo').files[0]) fd.append('photo', $('#photo').files[0]);
+  if (dogSubmitting) return;            // 이미 저장 중이면 무시 (버튼 두 번 눌러도 1번만)
+  dogSubmitting = true;
+  const submitBtn = $('#dogForm button[type=submit]');
+  const origText = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = '저장 중…';
 
-  const url = id ? `/api/dogs/${id}` : '/api/dogs';
-  const method = id ? 'PUT' : 'POST';
-  const res = await fetch(url, { method, body: fd });
-  if (!res.ok) { alert((await res.json()).error || '저장 실패'); return; }
-  const data = await res.json();
-  $('#dogModal').hidden = true;
-  resetExifBox();
-  if (!id && data.autoNamed) toast(`🐶 이름을 '${data.name}'(으)로 지어줬어요`);
-  if ($('#photo').files[0]) {
-    if (data.exifGps) toast('📍 위치: ' + (data.address || '지도에 표시했어요!'));
-    else toast('ℹ️ 사진에 GPS 위치정보가 없어요.');
+  const id = $('#dogId').value;
+  const hadPhoto = !!$('#photo').files[0];
+  try {
+    const fd = new FormData();
+    fd.append('name', $('#name').value);
+    fd.append('gender', $('#gender').value);
+    fd.append('age', $('#age').value);
+    fd.append('location', $('#location').value);
+    fd.append('notes', $('#notes').value);
+    fd.append('found_at', $('#found_at').value);
+    if (hadPhoto) fd.append('photo', $('#photo').files[0]);
+
+    const url = id ? `/api/dogs/${id}` : '/api/dogs';
+    const method = id ? 'PUT' : 'POST';
+    const res = await fetch(url, { method, body: fd });
+    if (!res.ok) { alert((await res.json()).error || '저장 실패'); return; }
+    const data = await res.json();
+    $('#dogModal').hidden = true;
+    resetExifBox();
+    if (!id && data.autoNamed) toast(`🐶 이름을 '${data.name}'(으)로 지어줬어요`);
+    if (hadPhoto) {
+      if (data.exifGps) toast('📍 위치: ' + (data.address || '지도에 표시했어요!'));
+      else toast('ℹ️ 사진에 GPS 위치정보가 없어요.');
+    }
+    if (id) showDetail(id); else loadDogs();
+  } catch (err) {
+    alert('저장 중 오류가 발생했어요. 잠시 후 다시 시도해주세요.');
+  } finally {
+    dogSubmitting = false;
+    submitBtn.disabled = false;
+    submitBtn.textContent = origText;
   }
-  if (id) showDetail(id); else loadDogs();
 });
 
 async function deleteDog(id) {
@@ -300,8 +317,14 @@ function openTreatModal(dogId) {
   $('#treatModal').hidden = false;
 }
 
+let treatSubmitting = false; // 중복 등록 방지
 $('#treatForm').addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (treatSubmitting) return;
+  treatSubmitting = true;
+  const btn = $('#treatForm button[type=submit]');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '추가 중…';
   const dogId = $('#treatDogId').value;
   const body = {
     date: $('#t_date').value,
@@ -309,13 +332,20 @@ $('#treatForm').addEventListener('submit', async (e) => {
     treatment: $('#t_treatment').value,
     hospital: $('#t_hospital').value,
   };
-  await fetch(`/api/dogs/${dogId}/treatments`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  $('#treatModal').hidden = true;
-  showDetail(dogId);
+  try {
+    await fetch(`/api/dogs/${dogId}/treatments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    $('#treatModal').hidden = true;
+    showDetail(dogId);
+  } catch {
+    alert('저장 중 오류가 발생했어요. 다시 시도해주세요.');
+  } finally {
+    treatSubmitting = false;
+    btn.disabled = false; btn.textContent = orig;
+  }
 });
 
 async function deleteTreatment(tid, dogId) {
